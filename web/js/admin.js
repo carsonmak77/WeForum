@@ -529,6 +529,7 @@
               <option value="local"${(cur.storage_mode || 'local') === 'local' ? ' selected' : ''}>本地文件（data/uploads 目录）</option>
               <option value="webdav"${(cur.storage_mode || 'local') === 'webdav' ? ' selected' : ''}>WebDAV 网盘（坚果云 / InfiniCloud / Yandex / 自建等）</option>
               <option value="baidu"${(cur.storage_mode || 'local') === 'baidu' ? ' selected' : ''}>百度网盘（开放平台原生 API）</option>
+              <option value="r2"${(cur.storage_mode || 'local') === 'r2' ? ' selected' : ''}>Cloudflare R2（S3 兼容）</option>
             </select>
           </label>
           <div class="tiny muted" style="margin-bottom:10px">启用外部存储后，<b>新上传</b>的图片将直接推送到网盘并返回网盘直链；旧帖子的历史图片地址不变。外部存储一旦不可用，会自动回退本地存储。</div>
@@ -567,6 +568,22 @@
               <span id="s-baidu-test-msg" class="tiny muted"></span>
             </div>
           </div>
+          <div id="r2-fields" style="display:${(cur.storage_mode || 'local') === 'r2' ? 'block' : 'none'}">
+            <label>R2 endpoint<input class="field" id="s-r2-endpoint" value="${esc(cur.r2_endpoint || '')}" placeholder="https://<account_id>.r2.cloudflarestorage.com" autocomplete="off" /></label>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+              <label>Bucket 名称<input class="field" id="s-r2-bucket" value="${esc(cur.r2_bucket || '')}" placeholder="weforum" autocomplete="off" /></label>
+              <label>Path prefix（可选）<input class="field" id="s-r2-path-prefix" value="${esc(cur.r2_path_prefix || '')}" placeholder="weforum/uploads" /><span class="tiny muted">对象键前缀，留空则存在 bucket 根目录</span></label>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+              <label>Access Key ID<input class="field" id="s-r2-access-key-id" value="${esc(cur.r2_access_key_id || '')}" placeholder="" autocomplete="off" /></label>
+              <label>Secret Access Key<input class="field" id="s-r2-secret-access-key" type="password" value="" placeholder="留空则不修改已保存的密钥" autocomplete="new-password" /><span class="tiny muted">当前已保存状态：${(cur.r2_secret_access_key || '').startsWith('***') ? '已配置' : (cur.r2_secret_access_key ? '已配置' : '未配置')}</span></label>
+            </div>
+            <label>公开访问地址（可选）<input class="field" id="s-r2-public-url" value="${esc(cur.r2_public_url || '')}" placeholder="https://pub-<hash>.r2.dev 或 https://cdn.example.com" /><span class="tiny muted">不填则使用 endpoint + bucket 的地址（通常无法公开访问）</span></label>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+              <button class="btn sm ghost" id="s-r2-test" type="button">测试 R2 连接</button>
+              <span id="s-r2-test-msg" class="tiny muted"></span>
+            </div>
+          </div>
         </div>
       </div>`;
     let logoData = cur.site_logo || '';
@@ -576,15 +593,18 @@
       logoData = await fileToDataURL(f, 256);
       $('#s-logo', box).innerHTML = `<img src="${esc(logoData)}" style="width:100%;height:100%;object-fit:cover" />`;
     };
-    // 存储模式切换：local/webdav/baidu 显隐对应字段
+    // 存储模式切换：local/webdav/baidu/r2 显隐对应字段
     const webdavFields = $('#webdav-fields', box);
     const baiduFields = $('#baidu-fields', box);
+    const r2Fields = $('#r2-fields', box);
     $('#s-storage-mode', box).onchange = () => {
       const v = $('#s-storage-mode', box).value;
       webdavFields.style.display = v === 'webdav' ? 'block' : 'none';
       baiduFields.style.display = v === 'baidu' ? 'block' : 'none';
+      r2Fields.style.display = v === 'r2' ? 'block' : 'none';
       $('#s-webdav-test-msg', box).textContent = '';
       $('#s-baidu-test-msg', box).textContent = '';
+      $('#s-r2-test-msg', box).textContent = '';
     };
     // 测试 WebDAV 连接
     $('#s-webdav-test', box).onclick = async () => {
@@ -628,6 +648,28 @@
         msg.style.color = '#E6655C';
       } finally { btn.disabled = false; btn.textContent = '测试 access_token'; }
     };
+    // 测试 R2 连接
+    $('#s-r2-test', box).onclick = async () => {
+      const btn = $('#s-r2-test', box);
+      const msg = $('#s-r2-test-msg', box);
+      btn.disabled = true; btn.textContent = '测试中…'; msg.textContent = '';
+      try {
+        const r = await admReq('/api/admin/storage/test', {
+          method: 'POST',
+          body: { kind: 'r2',
+            endpoint: $('#s-r2-endpoint', box).value.trim(),
+            bucket: $('#s-r2-bucket', box).value.trim(),
+            access_key_id: $('#s-r2-access-key-id', box).value.trim(),
+            secret_access_key: $('#s-r2-secret-access-key', box).value || cur.r2_secret_access_key || '',
+          },
+        });
+        msg.textContent = r?.ok ? `✅ ${r.msg}` : `❌ ${r.msg}`;
+        msg.style.color = r?.ok ? 'var(--brand)' : '#E6655C';
+      } catch (e) {
+        msg.textContent = `❌ ${e.message || '测试失败'}`;
+        msg.style.color = '#E6655C';
+      } finally { btn.disabled = false; btn.textContent = '测试 R2 连接'; }
+    };
     $('#s-save', box).onclick = async () => {
       const payload = {
         site_name: $('#s-name', box).value.trim(),
@@ -663,6 +705,11 @@
         webdav_public_url: $('#s-webdav-public', box).value.trim(),
         baidu_dir: $('#s-baidu-dir', box).value.trim(),
         baidu_public_url: $('#s-baidu-public', box).value.trim(),
+        r2_endpoint: $('#s-r2-endpoint', box).value.trim(),
+        r2_bucket: $('#s-r2-bucket', box).value.trim(),
+        r2_path_prefix: $('#s-r2-path-prefix', box).value.trim(),
+        r2_public_url: $('#s-r2-public-url', box).value.trim(),
+        r2_access_key_id: $('#s-r2-access-key-id', box).value.trim(),
       };
       // 密码留空表示不修改，避免误清空已保存的 SMTP 授权码
       const smtpPass = $('#s-smtp-pass', box).value;
@@ -673,6 +720,9 @@
       // 百度网盘 access_token 留空也不修改
       const baiduToken = $('#s-baidu-token', box).value;
       if (baiduToken) payload.baidu_token = baiduToken;
+      // R2 Secret Access Key 留空也不修改
+      const r2Secret = $('#s-r2-secret-access-key', box).value;
+      if (r2Secret) payload.r2_secret_access_key = r2Secret;
       if (logoData) payload.site_logo = logoData;
       const btn = $('#s-save', box);
       btn.disabled = true; btn.textContent = '保存中…';

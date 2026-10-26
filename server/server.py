@@ -977,6 +977,138 @@ def baidu_upload_file(raw_bytes, remote_path, access_token):
     return remote_path, fsid
 
 
+# ---------------- Cloudflare R2（S3 兼容） ----------------
+# 使用标准库实现 AWS Signature Version 4，向 R2 的 S3 兼容 API 上传对象。
+
+R2_REGION = "auto"
+R2_SERVICE = "s3"
+
+
+class _R2Error(Exception):
+    def __init__(self, status, message=""):
+        self.status = int(status) if status else 0
+        self.message = message
+        super().__init__(f"R2 {self.status}: {message}")
+
+
+def _r2_sha256(data):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _r2_hmac(key, msg):
+    if isinstance(msg, str):
+        msg = msg.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+
+def _r2_request(cfg, method, object_key, body=b"", headers=None, timeout=30):
+    """向 R2 发起已签名的 S3 请求。object_key 为 bucket 内的对象键（不含 bucket）。"""
+    endpoint = cfg.get("r2_endpoint", "").rstrip("/")
+    bucket = cfg.get("r2_bucket", "")
+    access_key = cfg.get("r2_access_key_id", "")
+    secret_key = cfg.get("r2_secret_access_key", "")
+    if not endpoint or not bucket or not access_key or not secret_key:
+        raise _R2Error(0, "R2 配置不完整")
+
+    host = urllib.parse.urlparse(endpoint).netloc
+    raw_path = f"/{bucket}/{object_key.lstrip('/')}"
+    canonical_uri = urllib.parse.quote(raw_path, safe="/") or "/"
+
+    amz_date = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    payload_hash = _r2_sha256(body)
+
+    hdrs = {}
+    if headers:
+        for k, v in headers.items():
+            hdrs[k] = v
+    hdrs.setdefault("Host", host)
+    hdrs.setdefault("X-Amz-Content-Sha256", payload_hash)
+    hdrs.setdefault("X-Amz-Date", amz_date)
+    if body is not None:
+        hdrs.setdefault("Content-Length", str(len(body)))
+
+    # 规范请求头
+    canon = {k.lower(): str(v).strip() for k, v in hdrs.items()}
+    signed_headers = ";".join(sorted(canon.keys()))
+    canonical_headers = "".join(f"{k}:{canon[k]}\n" for k in sorted(canon.keys()))
+
+    canonical_request = (
+        f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{date_stamp}/{R2_REGION}/{R2_SERVICE}/aws4_request"
+    string_to_sign = (
+        f"{algorithm}\n{amz_date}\n{credential_scope}\n{_r2_sha256(canonical_request)}"
+    )
+
+    k_date = _r2_hmac(f"AWS4{secret_key}".encode("utf-8"), date_stamp)
+    k_region = _r2_hmac(k_date, R2_REGION)
+    k_service = _r2_hmac(k_region, R2_SERVICE)
+    k_signing = _r2_hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    hdrs["Authorization"] = (
+        f"{algorithm} Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    full_url = endpoint + urllib.parse.quote(raw_path, safe="/")
+    req = urllib.request.Request(full_url, data=body, method=method, headers=hdrs)
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        err_body = b""
+        try:
+            err_body = e.read()
+        except Exception:
+            pass
+        msg = err_body[:300].decode("utf-8", errors="ignore") if err_body else ""
+        raise _R2Error(e.code, msg)
+    except Exception as e:
+        raise _R2Error(0, str(e))
+
+
+def r2_test_connection(cfg):
+    """测试 R2 连接是否可达。返回 (ok: bool, msg: str)。"""
+    endpoint = (cfg.get("endpoint") or "").strip().rstrip("/")
+    bucket = (cfg.get("bucket") or "").strip()
+    access_key = (cfg.get("access_key_id") or "").strip()
+    secret_key = cfg.get("secret_access_key") or ""
+    if not endpoint:
+        return False, "未填写 R2 endpoint"
+    if not bucket:
+        return False, "未填写 R2 bucket"
+    if not access_key:
+        return False, "未填写 Access Key ID"
+    if not secret_key:
+        return False, "未填写 Secret Access Key"
+
+    full_cfg = {
+        "r2_endpoint": endpoint,
+        "r2_bucket": bucket,
+        "r2_access_key_id": access_key,
+        "r2_secret_access_key": secret_key,
+    }
+    test_key = ".weforum_r2_test"
+    try:
+        status, _ = _r2_request(full_cfg, "PUT", test_key, body=b"ok",
+                                headers={"Content-Type": "text/plain"})
+        if status not in (200, 201):
+            raise _R2Error(status, "上传测试对象失败")
+    except _R2Error as e:
+        return False, f"连接/上传测试失败：HTTP {e.status} {e.message[:120]}"
+    try:
+        _r2_request(full_cfg, "DELETE", test_key)
+    except _R2Error as e:
+        return False, f"测试文件删除失败：HTTP {e.status} {e.message[:120]}"
+    return True, "连接成功"
+
+
 # ---------------- 上传路由：本地 or 外部存储 ----------------
 
 def _storage_config(conn):
@@ -993,6 +1125,13 @@ def _storage_config(conn):
         "baidu_token": setting(conn, "baidu_token", "") or "",
         "baidu_dir": (setting(conn, "baidu_dir", "") or "weforum/uploads").strip() or "weforum/uploads",
         "baidu_public_url": (setting(conn, "baidu_public_url", "") or "").strip(),
+        # Cloudflare R2（S3 兼容）
+        "r2_endpoint": (setting(conn, "r2_endpoint", "") or "").strip(),
+        "r2_bucket": (setting(conn, "r2_bucket", "") or "").strip(),
+        "r2_access_key_id": (setting(conn, "r2_access_key_id", "") or "").strip(),
+        "r2_secret_access_key": setting(conn, "r2_secret_access_key", "") or "",
+        "r2_public_url": (setting(conn, "r2_public_url", "") or "").strip(),
+        "r2_path_prefix": (setting(conn, "r2_path_prefix", "") or "").strip(),
     }
 
 
@@ -1027,9 +1166,34 @@ def save_to_baidu(raw_bytes, filename, conn):
     return remote
 
 
+def save_to_r2(raw_bytes, filename, content_type, conn):
+    """把已解码的原始字节上传到 Cloudflare R2，返回公开可访问 URL。"""
+    cfg = _storage_config(conn)
+    if cfg["mode"] != "r2" or not cfg["r2_endpoint"] or not cfg["r2_bucket"]:
+        raise ValueError("R2 未配置")
+    if not cfg["r2_access_key_id"] or not cfg["r2_secret_access_key"]:
+        raise ValueError("R2 密钥未配置")
+
+    prefix = cfg["r2_path_prefix"].strip("/")
+    object_key = f"{prefix}/{filename}" if prefix else filename
+
+    headers = {}
+    if content_type:
+        headers["Content-Type"] = content_type
+    status, _ = _r2_request(cfg, "PUT", object_key, body=raw_bytes, headers=headers)
+    if status not in (200, 201):
+        raise _R2Error(status, "上传失败")
+
+    pub_base = cfg["r2_public_url"].rstrip("/") if cfg["r2_public_url"] else ""
+    if pub_base:
+        return pub_base + "/" + urllib.parse.quote(object_key, safe="/")
+    endpoint = cfg["r2_endpoint"].rstrip("/")
+    return endpoint + "/" + cfg["r2_bucket"] + "/" + urllib.parse.quote(object_key, safe="/")
+
+
 def save_data_url(data_url, conn=None):
     """把 data:image/...;base64,xxx 保存为文件，返回可访问 URL。
-    conn 传入时支持自动路由到外部存储（WebDAV / 百度网盘），不传则永远本地。
+    conn 传入时支持自动路由到外部存储（WebDAV / 百度网盘 / R2），不传则永远本地。
     """
     m = re.match(r"^data:(image|audio)/([a-zA-Z0-9.+-]+);base64,(.+)$", data_url, re.S)
     if not m:
@@ -1051,6 +1215,9 @@ def save_data_url(data_url, conn=None):
                 return save_to_webdav(raw, name, ct, conn)
             if cfg["mode"] == "baidu" and cfg["baidu_token"]:
                 return save_to_baidu(raw, name, conn)
+            if cfg["mode"] == "r2" and cfg["r2_endpoint"] and cfg["r2_bucket"]:
+                ct = m.group(1) + "/" + ext
+                return save_to_r2(raw, name, ct, conn)
         except Exception:
             # 外部存储失败时自动回退到本地，不影响用户上传
             pass
@@ -1690,7 +1857,7 @@ class API:
         rows = self.conn.execute("SELECT key, value FROM site_settings").fetchall()
         out = {r["key"]: r["value"] for r in rows}
         # 密码类敏感字段：不向前端返回明文，仅表示"已设置"或"未设置"
-        for secret_key in ("smtp_pass", "webdav_pass", "baidu_token"):
+        for secret_key in ("smtp_pass", "webdav_pass", "baidu_token", "r2_secret_access_key"):
             if secret_key in out:
                 out[secret_key] = "***" if (out.get(secret_key) or "").strip() else ""
         return out
@@ -2539,7 +2706,9 @@ class API:
                        "smtp_name", "smtp_ssl", "site_email_verify",
                        "storage_mode", "webdav_url", "webdav_user", "webdav_pass",
                        "webdav_path", "webdav_public_url",
-                       "baidu_token", "baidu_dir", "baidu_public_url")
+                       "baidu_token", "baidu_dir", "baidu_public_url",
+                       "r2_endpoint", "r2_bucket", "r2_access_key_id", "r2_secret_access_key",
+                       "r2_public_url", "r2_path_prefix")
             for key, val in data.items():
                 if key not in allowed:
                     continue
@@ -2565,12 +2734,15 @@ class API:
                 # 存储配置专项清洗
                 if key == "storage_mode":
                     v = str(val).strip().lower()
-                    val = v if v in ("local", "webdav", "baidu") else "local"
+                    val = v if v in ("local", "webdav", "baidu", "r2") else "local"
                 if key in ("webdav_url", "webdav_public_url", "webdav_user", "webdav_path",
-                           "baidu_dir", "baidu_public_url"):
+                           "baidu_dir", "baidu_public_url",
+                           "r2_endpoint", "r2_public_url", "r2_path_prefix"):
                     val = str(val or "").strip()[:300]
-                # access_token 原样存储（只做基本清理，不截断）
-                if key == "baidu_token":
+                if key in ("r2_bucket", "r2_access_key_id"):
+                    val = str(val or "").strip()
+                # access_token / secret key 原样存储（只做基本清理，不截断）
+                if key in ("baidu_token", "r2_secret_access_key"):
                     val = str(val or "").strip()
                 # JSON 类型字段直接原样存储（字符串）
                 if key in ("site_vip_plans", "site_announcements", "quick_replies"):
@@ -2622,6 +2794,12 @@ class API:
             kind = str(body.get("kind") or "webdav").strip().lower()
             if kind == "baidu":
                 ok_flag, msg = baidu_test_connection({"token": body.get("token")})
+            elif kind == "r2":
+                ok_flag, msg = r2_test_connection({
+                    "endpoint": body.get("endpoint"), "bucket": body.get("bucket"),
+                    "access_key_id": body.get("access_key_id"),
+                    "secret_access_key": body.get("secret_access_key"),
+                })
             else:
                 ok_flag, msg = webdav_test_connection({
                     "url": body.get("url"), "user": body.get("user"), "pass": body.get("pass"),
